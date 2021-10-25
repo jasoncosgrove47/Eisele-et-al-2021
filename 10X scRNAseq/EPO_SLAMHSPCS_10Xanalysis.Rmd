@@ -1,0 +1,463 @@
+---
+title: "Analysis of EPO-treated HSCs by scRNAseq"
+output: html_document
+author: Jason Cosgrove (jason.cosgrove@curie.fr) / Almut Eisele (almut.eisele@curie.fr)
+---
+  
+<style type="text/css">
+  
+  body{ /* Normal  */
+      font-size: 12px;
+  }
+  
+  
+td {  /* Table  */
+    font-size: 8px;
+}
+h1.title {
+  font-size: 38px;
+  color: DarkRed;
+}
+h1 { /* Header 1 */
+    font-size: 28px;
+  color: DarkBlue;
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+  color: DarkBlue;
+}
+h3 { /* Header 3 */
+    font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+</style>
+
+
+In this specific study we would like to understand the effect of EPO on HSC transcriptomic identity. Specifically, CD150+ HSCs were taken from mice and incubated with EPO or No EPO (Ctrl) for 16hrs. Cells from each condition were then sequenced on the 10X Genomics platform, a droplet based approach to isolate single-cells for sequencing. 
+
+
+\newline
+
+
+```{r message=FALSE, message = FALSE, warning = FALSE}
+
+rm(list=ls())
+
+set.seed(200)
+
+
+setwd("/Users/almut/Dropbox (Team Perié)/Eisele et al EPO/Rcode by Jason")
+
+#load in helper methods to perform required to perform the analysis
+source("EPO_helpermethods.R")
+
+#load in external packages that we need to complete the analysis
+usePackage("Seurat")
+usePackage("scran")
+usePackage("org.Mm.eg.db")
+usePackage("clustree")
+usePackage("scater")
+usePackage("SingleCellExperiment")
+usePackage("limma")
+usePackage("dplyr")
+usePackage("scales")
+usePackage("RANN")
+usePackage("FSA")
+
+```
+
+
+
+#### Step 2. Load in the dataset. 
+In this step we load the datasets for EPO and control into R and convert into a Seurat object. This is an R structure that facilitates data QC and analyses such as dimensionality reduction and clustering. 
+
+\newpage
+
+```{r loaddata, eval= T, message = FALSE, warning = FALSE}
+
+SlamHSCs <- generateSeuratObject()
+
+
+```
+
+
+
+#### Step 3. QC processing and filtering. 
+
+To assess the quality of the data we assess the library sizes, numbers of genes expressed and mitochondrial content per cell. It has been poisted that cells which have very high library sizes or relative to other cells in the data may represent doublet cells. However, in our experiments we have very low cell numbers, and thus the probabiilty of finding doublets is not very high in a droplet based sequencing experiment. In addition, we benchmarked our pipeline to find out how many DEGs overlap with known EPO signatures from the wider literature and fine higher consistency when we do not set an upper limit on library sizes.
+
+Cells with very low library sizes are typically because of poor capture quality pontentially due to cell death, premature rupture, or capture of random mRNA escaping from cells, consequently cells with low library sizes are also filtered out from downstream analyses. 
+
+Another important QC metric is mitochondrial content. As discussed in AlJanahi et al (2018) "High numbers of mitochondrial transcripts are indicators of cell stress, and therefore cells with elevated mitochondrial gene expression are often not included in the analysis, because most experiments will not benefit from clustering cells based on stress levels." In our system we know that upon exiting quiescence HSCs increase their mitochondrial mass to cope with increased metabolic demands. Consequently, we expect quite large spread of mitochondrial content in SLAM+ HSCs and only remove very extreme values. 
+
+ 
+
+\newpage
+
+```{r QC,eval = T, message = FALSE, warning = FALSE}
+
+#find the percentage of mitochondrial genes
+SlamHSCs<- Seurat::PercentageFeatureSet(object = SlamHSCs, pattern = "^mt-", col.name = "percent.mt")
+
+
+#plot key QC metrics
+VlnPlot(object = SlamHSCs, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+
+
+SlamHSCs <- subset(SlamHSCs, subset = nFeature_RNA > 1000 & percent.mt < 12)
+                
+#lets visualise the data again to see the effects of our filtering
+VlnPlot(object = SlamHSCs, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+
+```
+
+
+
+# Step 4. Cell cycle annotation
+
+As we sequence sorted SLAM+ HSCs, we expect some heterogeneity with respect to cell-cycle status. To assign a cell cycle phase to each cell, we use the cyclone method (described in Scialdone et al 2015) in the R package scran. In this scheme, a supervised learning approach was used to identify pairs of markers for each cell cycle phase. A G1 marker pair would comprise a gene with high expression in G1 relative to other phases, while the second gene would be lower in G1 relative to all other phases. To classify cell cycle phase on a new dataset, cyclone calculates the proportion of all marker pairs for which the expression of the first gene is higher than the second gene. A high proportion then suggests that the cell belongs to a given cell cycle phase. 
+
+```{r cellCycle, eval = T, message = FALSE, warning = FALSE}
+
+mm.pairs <- readRDS(system.file("exdata", "mouse_cycle_markers.rds", package="scran"))
+ensembl <- mapIds(org.Mm.eg.db, keys=rownames(SlamHSCs), keytype="SYMBOL", column="ENSEMBL")
+assignments <- cyclone(SlamHSCs@assays$RNA@data, mm.pairs, gene.names=ensembl)
+SlamHSCs@meta.data$phases <- assignments$phases
+SlamHSCs@meta.data$G1_score <- assignments$normalized.scores$G1
+SlamHSCs@meta.data$S_score <- assignments$normalized.scores$S
+SlamHSCs@meta.data$G2M_score <- assignments$normalized.scores$G2M
+table(SlamHSCs@meta.data$phases)
+
+
+#see if there are any differences in cell cycle status between EPO and Control
+Idents(SlamHSCs) <- SlamHSCs@meta.data$condition
+counts <- table(Idents(SlamHSCs), SlamHSCs@meta.data$phases)
+barplot(as.matrix(counts), legend = rownames(counts),col = hue_pal()(2))#gfpneg
+prop.df <- data.frame(cbind(data.frame(prop.table(counts[,1])),data.frame(prop.table(counts[,2])),data.frame(prop.table(counts[,3]))))
+colnames(prop.df) <- c("G1", "G2M", "S")
+barplot(as.matrix(prop.df), legend = rownames(counts),col = hue_pal()(2))#gfpneg
+
+
+```
+
+
+# Step 5. Feature selection
+
+Another important step we perform here is to find variably expressed genes to take forward for further analysis. To do this we use Seurats vst method. Briefly, this approach models the relationship between log mean expression and log variance using local polynomial regression. The features values are then standardized using the observed mean and predicted variance, with the final variance value calculated on the standardized values. 
+
+
+```{r HVGs, eval = T,message = FALSE, warning = FALSE}
+
+# FindVariableGenes calculates the average expression and dispersion for each gene, places these genes 
+# into bins, and then calculates a z-score for dispersion within each bin. This helps control for the 
+# relationship between variability and average expression. 
+SlamHSCs <- FindVariableFeatures(SlamHSCs, selection.method = "vst", nfeatures = 5000, 
+        verbose = FALSE)
+VariableFeaturePlot(SlamHSCs)
+
+```
+
+
+# Step 6. Data normalisation 
+
+
+When analyzing sequencing data, normalization to eliminate condition effects is crucial if multiple sequencing runs are to be compared with each other. These condition effects can be caused by often unavoidable technical variations such as the duration samples were kept on ice, number of freeze-thaw cycles, method of RNA isolation, sequencing depth, etc.
+
+An additional consideration is that droplet-based sequencing in addition consists of thousands of individual cell experiments, hence cell-specific biases must also be considered when normalizing, in order to be able to compare the expression of one cell to another.  A notable cell-specific bias is caused by mRNA capture efficiency, where the mRNA molecules are not captured by the bead at the same proportion in all droplets. As individual cells are not all of the same type a key consideration is how to retain cell to cell variability while eliminating technical noise. 
+
+To normalise our data we use the default approach in seurat and also sctransform. In the default approach feature counts for each cell are divided by the total counts for that cell and multiplied by the scale.factor. This is then natural-log transformed using log1p.In the scTransform approach you take the Pearson residuals from ’regularized negative binomial regression’, where cellular sequencing depth is utilized as a covariate in a generalized linear model, to remove the influence of technical characteristics from downstream analyses while preserving biological heterogeneity. In their preprint
+they show that an unconstrained negative binomial model may overfit scRNA-seq data, and overcome this by pooling information across genes with similar abundances to obtain stable parameter estimates.
+
+In our benchmarking we find higher consistency between DEGs and published EPO signatures when applying the default normalisation approach and so use this normalisation method for downstream analyses. We also run some PCA based plots to visualise the effect that each normalisation procedure is having on the data. 
+
+```{r Normalisation, eval = T,message = FALSE, warning = FALSE}
+
+SlamHSCs <- NormalizeData(object = SlamHSCs)
+SlamHSCs <- ScaleData(object = SlamHSCs,features = rownames(SlamHSCs))
+
+SlamHSCs <- SCTransform(object = SlamHSCs, verbose = FALSE,variable.features.n = 5000, 
+                    conserve.memory = F,return.only.var.genes = F )
+
+#compare these two normalisation methods through PCA based plots
+sct.res <- checkNormalisation("SCT", SlamHSCs)
+rna.res <- checkNormalisation("RNA", SlamHSCs)
+multiplot(rna.res$p1, sct.res$p2, rna.res$p2)
+
+
+#we see that the amount of variance maintained between the two methods is the same
+# in benchmarking studies where we see how well the different normalisation approaches
+# can affect the results of our differential expression analysis in terms of known genes
+# we find that the default approach is working better
+#set the default normalisation as the default for downstream analyses
+SlamHSCs@active.assay <- "RNA"
+
+
+#save the seurat object so we can just load it in later and we dont need to keep recomputing these steps
+save(SlamHSCs,file="seurat_object.rda")
+
+```
+
+
+
+##### Step 7. Dimensionality Reduction
+
+We perform dimensionality reduction on variably expressed genes using both principle component analysis, an approach to find the linear combination of genes that are the greatest source of variance in the data, and independent component analysis, a signal processing method designed to separate different signals (in this context a signal is a biological process) that are linearly mixed together. Informally, if you had a smoothie, ICA can tell you what the ingredients are.
+
+We visualize our data using the non-linear dimensionality reduction technique UMAP. This approach is analogous to PCA, but can also identify non-linear patterns in the data. The goal of the algorithm is to learn the underlying manifold of the data in order to place similar cells together in low-dimensional space. UMAP is preferable to t-SNE as it is faster to compute, and uses a graph based approach which permits the organisation clusters into a more biologically accurate representation than t-SNE. Importantly, we use the first 10 independent components as inputs into the UMAP algorithm, this reduces noise and when compared to PCA tended to group cells by established descriptions rather than by cell cycle status, although there was still a dominant cell cycle effect. 
+\newpage
+
+```{r dimensionalityReduction, eval = TRUE, message = FALSE, warning = FALSE}
+
+SlamHSCs <- FindVariableFeatures(SlamHSCs, selection.method = "vst", nfeatures = 5000, 
+        verbose = FALSE)
+SlamHSCs <- RunPCA(object = SlamHSCs, verbose = FALSE,npcs = 50, features = rownames(SlamHSCs))
+ElbowPlot(SlamHSCs,ndims = 50)
+
+SlamHSCs <- RunUMAP(object = SlamHSCs, dims = 1:10, verbose = FALSE,assay= "RNA",reduction = "pca",spread = 0.25)
+
+DimPlot(object = SlamHSCs, label = F,reduction = "umap", pt.size = 2,group.by = "condition",
+        cols = c("grey50", "red")) 
+
+
+
+```
+
+
+
+# Step 8. Unsupervised Clustering
+
+In this part of the analysis we perform unsupervised clustering using Seurats graph based approach. 
+
+Briefly, this approach involves embedding cells in a graph structure such as a K-nearest neighbour graph, with edges drawn between cells with similar feature expression patterns, and then attempts to partition this graph into a number of highly interconnected subepostatus. As LSK cells do not form discrete clusters, but rather show a smooth continuum of expression, our clustering results were highly sensitive to the resolution parameter of Seurats clustering algorithm. Prior to fixing a value of this parameter we determine how sensitive our clustering is to changes in resolution as this will better enable us to interpret clustering based results. 
+
+
+```{r Clustering, eval = TRUE, message = FALSE, warning = FALSE}
+
+
+#perform a cluster robustness analysis changing the resolution parameter of the clustering algo
+SlamHSCs <- clusterRobustnessAnalysis(SlamHSCs, min_resolution = 0.1, max_resolution = 1)
+clustree(SlamHSCs, prefix = "RNA_snn_res.",assay = "RNA")
+
+#from our stability analysis we find 3 core clusters that are stable within the dataset
+SlamHSCs <- FindClusters(object = SlamHSCs, resolution = 0.1)
+DimPlot(SlamHSCs)
+
+
+```
+
+
+
+
+To facilitate cluster annotation we provide methods that perform differential expression analysis and also overlay the expression on transcriptomic signatures obtained from the wider literature. 
+
+```{r InterpretClustering, eval = TRUE, message = FALSE, warning = FALSE}
+markers <-  FindAllMarkers(SlamHSCs,only.pos = TRUE,test.use = "LR",return.thresh = 0.05,logfc.threshold = 0.1)#LR and 
+x <-markers %>% group_by(cluster) %>% top_n(10, avg_logFC)
+print(tbl_df(x), n=40)
+DoHeatmap(SlamHSCs, features = x$gene,disp.min = -1.5,disp.max = 1.5,label =F)
+
+```
+
+
+
+# Step 9: Overlay published signatures
+To put our data in the context of the wider literature we overlay signatures obtained from the wider literature
+```{r Gene_sets, eval = TRUE, message = FALSE, warning = FALSE}
+#you can also look at genesets to help annotate the clusters
+fp <-"genesets/published_genesets.csv"
+
+gene.set.names <- c("WilsonMolO","Nina_mpp1","Nina_dHSCs", "Nina_aHSCs","MPP2_Pietras","MPP3_Pietras",
+                    "MPP4_Pietras")
+
+SlamHSCs <- customGeneSetScore(SlamHSCs, gene.set.names, gene.set.fp = fp)
+
+p1 <- VlnPlot(object = SlamHSCs, features = "WilsonMolO1", pt.size = 0.2)
+p2 <- VlnPlot(object = SlamHSCs, features = "Nina_dHSCs1", pt.size = 0.2)
+p3 <- VlnPlot(object = SlamHSCs, features = "Nina_mpp11", pt.size = 0.2)
+p4 <- VlnPlot(object = SlamHSCs, features = "MPP2_Pietras1", pt.size = 0.2)
+multiplot(p1,p2,p3,p4, cols = 2)
+
+#test whether there are significant differences between the groups
+kruskal.test(WilsonMolO1 ~ ident, data = p1$data)
+
+dunnTest(MPP2_Pietras1 ~ ident,
+              data=p4$data,
+              method="bh")    
+
+```
+
+# Step 10. Differential expression
+Compare Ctrl vs EPO using DEG approach.
+
+To understand between key differences between our clusters, we perform a differential expression analysis. It is important to note that different approaches for differential expression analysis of single cells rely on different assumptions about that data, and consequently can give very different results. In this analysis we use a logistic regression approach. 
+
+In the approach below we employ a logistic regression framework to determine differentially expressed genes. Specifically, we construct a logistic regression model predicting group membership based on each feature individually and compares this to a null model with a likelihood ratio test. This approach is advantageous for the analysis of HSPCs which have an expression profile that is distinct from mature cell subsets. Typically, expression profiles are bimodal, and changes in the magnitude of expression are subtle. In other datasets we have noted that cells have similar expression magnitudes but that different proportions of cells are positive for a given gene, within a given group. Given these unique features of our data, we posit that logistic regression is well suited to performing differential expression analysis of our data.
+
+
+
+```{r Seurat_DE, eval = TRUE, message = FALSE, warning = FALSE}
+
+
+#set condition as the identity 
+Idents(SlamHSCs) <- SlamHSCs@meta.data$condition
+#run the DE analysis
+markers <-  FindMarkers(SlamHSCs,test.use = "LR",logfc.threshold = 0.001, ident.1 = "EPO_treated")
+
+#plot results
+volcanoPlot(markers)
+
+
+```
+
+
+# Step 11. Permutation testing to assess significance of DE analysis
+
+We see a number of differentially expressed genes between the groups, however how many genes would be expect to be different, just due to chance? We can address this question using permutation testing. 
+
+```{r DEGs_permutationTest, eval = T}
+
+#the number of permutations that you would like to perform
+permutation.test <- sapply(1:50, performDEA)
+
+#this histogram shows how many DEGs we would expect just due to chance. 
+hist(permutation.test)
+
+#how many DEGs do we get with the real comparison
+Idents(SlamHSCs) <- SlamHSCs@meta.data$condition
+markers <- FindAllMarkers(SlamHSCs, verbose = F,
+                test.use="LR",logfc.threshold = 0.05,
+               only.pos=F,return.thresh = 0.05)
+
+#what is the max amount of genes that would be differentially expressed just due to chance
+print(nrow(permutation.test))
+#how many differentially expressed genes do we see between our groups
+print(nrow(markers))
+
+```
+
+# Step 12: Assessing the heterogeneity of the EPO response
+
+Based on our differentially expressed genes, are all genes in the EPO group driving these molecular differences or just a subset. To address this question we generate a composite score for all of the genes enriched in the EPO group and plot this composite score at the single cell level
+
+```{r findResponders, eval = T}
+
+
+SlamHSCs <- generate_EPOResponseSignature(SlamHSCs, markers)
+FeaturePlot(SlamHSCs, features = "EPOnet", min.cutoff = "q3", max.cutoff = "q97", pt.size = 2, cols = c("lightgrey","red"))
+
+SlamHSCs <- setEPOStatus(SlamHSCs, 0.9)
+
+EPO <- subset(SlamHSCs, cells = colnames(SlamHSCs@assays$RNA)[SlamHSCs@meta.data$condition ==  "EPO_treated"])
+#overlay this classification onto our UMAP
+DimPlot(EPO, group.by = "eporesponder", pt.size = 2, cols = c("lightpink","red"))
+
+```
+
+
+
+```{r classifyresponders, eval = T}
+#Find markers for our 3 groups of interest
+Idents(SlamHSCs) <- SlamHSCs@meta.data$epostatus
+
+
+markers <-  FindAllMarkers(SlamHSCs,only.pos = TRUE,test.use = "LR",return.thresh = 0.05,logfc.threshold = 0.05)
+x <-markers %>% group_by(cluster) %>% top_n(10, avg_logFC)
+print(tbl_df(x), n=40)
+DoHeatmap(SlamHSCs, features = x$gene,disp.min = -1.5,disp.max = 1.5,label =F)
+
+#check the distribution of our groups among our unsupervised clusters
+counts <- table(SlamHSCs@meta.data$RNA_snn_res.0.1, SlamHSCs@meta.data$epostatus)
+prop.df <- data.frame(cbind(data.frame(prop.table(counts[,1])),data.frame(prop.table(counts[,3])) , data.frame(prop.table(counts[,4]))))
+colnames(prop.df) <- c("Control","EPO_responder", "EPO_nonresponder")
+barplot(as.matrix(prop.df), beside = F, legend = F,col = hue_pal()(length(unique(SlamHSCs@meta.data$phases))))#gfpneg
+
+#Does EPO status correlate with epo receptor expression?
+p1 <- VlnPlot(SlamHSCs,"WilsonMolO1",group.by = "epostatus",pt.size = 0.2, cols = c("light grey","red","lightpink")) + NoLegend()
+p2 <- VlnPlot(SlamHSCs,"Ephb4",group.by = "epostatus",pt.size = 0.2, cols = c("light grey","red","lightpink")) + NoLegend()
+p3 <- VlnPlot(SlamHSCs,"Csf2rb",group.by = "epostatus",pt.size = 0.2, cols = c("light grey","red","lightpink")) + NoLegend()
+
+multiplot(p1,p2,p3, cols = 3)
+
+```
+
+
+
+
+
+
+
+# Step 13: Supervised celltype analysis
+
+44802 cKit+ with biased sampling to enrich for SlamHSCs. sequencing done on 10X
+
+```{r Dahlin, echo=FALSE, eval= TRUE}
+
+
+#load in all of the datasets that w need
+load("datasets/Dahlin/Dahlin.Rda") #dahlin dataset
+load("datasets/Tusi/Tusi_seurat_control_only.Rda") # Tusi dataset
+load("datasets/Wilson/wilson_seurat.rda") # Wilson dataset
+
+#get all genes in common between our datasets
+genes <- Reduce(intersect, list(rownames(TusiEPO.control@assays$RNA@data),
+                                rownames(wilson@assays$RNA@data),
+                                rownames(SlamHSCs@assays$RNA@data),
+                                rownames(dahlin@reductions$pca@feature.loadings)))
+
+
+
+nearestNeighbourMapping(dahlin, wilson)
+
+queryDataset<- subset(TusiEPO.control, idents = "E")
+nearestNeighbourMapping(dahlin, queryDataset)
+
+EPO <- subset(SlamHSCs, cells = colnames(SlamHSCs@assays$RNA)[SlamHSCs@meta.data$epostatus ==  "EPO_responsive"])
+nearestNeighbourMapping(dahlin, EPO,plotColor = "grey30")
+
+ctrl <- subset(SlamHSCs, cells = colnames(SlamHSCs@assays$RNA)[SlamHSCs@meta.data$condition ==  "Control"])
+nearestNeighbourMapping(dahlin, ctrl)
+
+
+cluster.0 <- subset(SlamHSCs, cells = colnames(SlamHSCs@assays$RNA)[SlamHSCs@meta.data$RNA_snn_res.0.1 ==  0])
+
+cluster.1 <- subset(SlamHSCs, cells = colnames(SlamHSCs@assays$RNA)[SlamHSCs@meta.data$RNA_snn_res.0.1 ==  1])
+
+cluster.2 <- subset(SlamHSCs, cells = colnames(SlamHSCs@assays$RNA)[SlamHSCs@meta.data$RNA_snn_res.0.1 ==  2])
+
+
+nearestNeighbourMapping(dahlin, cluster.0,plotColor = "red")
+nearestNeighbourMapping(dahlin, cluster.1,plotColor = "green")
+nearestNeighbourMapping(dahlin, cluster.2,plotColor = "blue")
+
+```
+
+# References: 
+
+1. Butler, Andrew et al. Integrating Single-Cell Transcriptomic Data across Different Conditions, Technologies, and Species. Nature Biotechnology 36, no. 5 (May 2018): 411???20. https://doi.org/10.1038/nbt.4096.
+
+2. Fan, Jean et al. Characterizing Transcriptional Heterogeneity through Pathway and Gene Set Overdispersion Analysis. Nature Methods 13, no. 3 (March 2016): 241???44. https://doi.org/10.1038/nmeth.3734.
+
+3. Kharchenko, Peter V., Lev Silberstein, and David T. Scadden. Bayesian Approach to Single-Cell Differential Expression Analysis. Nature Methods 11, no. 7 (July 2014): 740???42. https://doi.org/10.1038/nmeth.2967.
+
+4. Scialdone, Antonio et al. Computational Assignment of Cell-Cycle Stage from Single-Cell Transcriptome Data. Methods (San Diego, Calif.) 85 (September 1, 2015): 54???61. https://doi.org/10.1016/j.ymeth.2015.06.021.
+
+5. Lun A, Risso D (2018). SingleCellExperiment: S4 Classes for Single Cell Data. R package version 1.4.0.
+
+6. Yang, Jennifer  et al. Single Cell Transcriptomics Reveals Unanticipated Features of Early Hematopoietic Precursors. Nucleic Acids Research 45, no. 3 (17 2017): 1281???96. https://doi.org/10.1093/nar/gkw1214.
+
+7. Giladi, Amir et al. Single-Cell Characterization of Haematopoietic Progenitors and Their Trajectories in Homeostasis and Perturbed Haematopoiesis. Nature Cell Biology 20, no. 7 (July 2018): 836???46. https://doi.org/10.1038/s41556-018-0121-4.
+
+8. Grover, Amit et al. Erythropoietin Guides Multipotent Hematopoietic Progenitor Cells toward an Erythroid Fate. Journal of Experimental Medicine 211, no. 2 (February 10, 2014): 181???88. https://doi.org/10.1084/jem.20131189.
+
+9. Tusi, Betsabeh Khoramian et al. Population Snapshots Predict Early Hematopoietic and Erythroid Hierarchies. Nature 555, no. 7694 (March 1, 2018): 54???60. https://doi.org/10.1038/nature25741.
+
+10. Singh, Rashim Pal et al. Hematopoietic Stem Cells but Not Multipotent Progenitors Drive Erythropoiesis during Chronic Erythroid Stress in EPO Transgenic Mice. Stem Cell Reports 10, no. 6 (June 5, 2018): 1908???19. https://doi.org/10.1016/j.stemcr.2018.04.012.
+
+11. AlJanahi, Aisha A., Mark Danielsen, and Cynthia E. Dunbar. ‘An Introduction to the Analysis of Single-Cell RNA-Sequencing Data’. Molecular Therapy - Methods & Clinical Development 10 (21 September 2018): 189–96. https://doi.org/10.1016/j.omtm.2018.07.003.
